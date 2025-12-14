@@ -688,7 +688,26 @@ def capture_and_process_loop(overlay):
         frame_count += 1
         
         # 检测球杆
-        lines = detect_cue_stick(img)
+        # 使用 aiming 模块检测并得到 overlay-ready 的 numpy lines
+annotated_img, aim_meta = process_frame_for_aim(img)
+lines_np = aim_meta.get('visual_lines_np', None)
+
+# 打印/调试信息（按需）
+if frame_count % 10 == 0:
+    if aim_meta.get('angle_deg') is not None:
+        print(f"帧 {frame_count}: 瞄准角度 {aim_meta['angle_deg']:+.1f}°, 线条数 {0 if lines_np is None else len(lines_np)}")
+    else:
+        print(f"帧 {frame_count}: 未识别完整瞄准信息, 线条数 {0 if lines_np is None else len(lines_np)}")
+
+# 传给 overlay（overlay.update_lines 接受 numpy.ndarray 形状 (N,1,4)）
+try:
+    overlay.update_lines(lines_np, img.shape if img is not None else None)
+except Exception as e:
+    try:
+        overlay.update_lines(None, img.shape if img is not None else None)
+    except:
+        pass
+        
         
         # 每10帧打印状态（更频繁）
         if frame_count % 10 == 0:
@@ -782,4 +801,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
