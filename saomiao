@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+实时截屏并提取辅助线（边缘 -> Hough 直线 -> 可选骨架）
+运行: python real_time_screen_guides.py
+按键:
+  q - 退出
+  r - 选择/重置 ROI（在弹出的窗口里选取）
+  h - 切换 Hough 直线显示
+  k - 切换骨架（skeletonize）显示（较慢）
+  o - 切换显示原图叠加
+  p - 暂停/继续处理
+"""
+
+import time
+import threading
+from queue import Queue, Empty
+import numpy as np
+import cv2
+import mss
+from skimage.morphology import skeletonize
+import win32gui
+import win32ui
+import win32con
+import win32api
+from ctypes import windll
+
+# --------- 配置 ----------
+MONITOR_INDEX = 1  # mss monitors 索引: 1 是主屏, 0 是全部虚拟区域
+CAPTURE_FPS_LIMIT = 30  # 最大捕获帧率（不会严格限制，但用于睡眠）
+SHOW_SCALE = 1.0  # 显示缩放（>1 放大, <1 缩小），用于性能
+# Hough 参数（可调）
+HOUGH_THRESH = 80
+HOUGH_MINLEN = 50
+HOUGH_MAXGAP = 10
+# Canny 参数（可调）
+CANNY_LOW = 50
+CANNY_HIGH = 150
+# --------------------------
+
+frame_q = Queue(maxsize=1)
+running = True
+target_hwnd = None  # 目标窗口句柄
+
+def list_windows():
+    """列出所有可见窗口"""
+    def callback(hwnd, windows):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if title:
+                windows.append((hwnd, title))
+        return True
+    windows = []
+    win32gui.EnumWindows(callback, windows)
+    return windows
+
+def capture_window(hwnd, region=None):
+    """捕获指定窗口的画面
+    region: (x, y, width, height) 相对于窗口的区域
+    """
+    try:
+        # 获取窗口大小（客户区）
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        width = right - left
+        height = bottom - top
+        
+        if width <= 0 or height <= 0:
+            return None
+        
+        # 如果指定了区域，使用区域大小，否则使用整个窗口
+        if region:
+            x, y, w, h = region
+            capture_width, capture_height = w, h
+        else:
+            x, y = 0, 0
+            capture_width, capture_height = width, height
+        
+        # 创建设备上下文
+        hwndDC = win32gui.GetWindowDC(hwnd)
+        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+        saveDC = mfcDC.CreateCompatibleDC()
+        
+        saveBitMap = win32ui.CreateBitmap()
+        saveBitMap.CreateCompatibleBitmap(mfcDC, capture_width, capture_height)
+        saveDC.SelectObject(saveBitMap)
+        
+        # 尝试使用 PrintWindow (对某些窗口更有效)
+        result = win32gui.PrintWindow(hwnd, saveDC.GetSafeHdc(), 3)  # 3 = PW_RENDERFULLCONTENT
+        
+        if result == 0:
+            # PrintWindow 失败，尝试 BitBlt
+            saveDC.BitBlt((0, 0), (capture_width, capture_height), mfcDC, (x, y), win32con.SRCCOPY)
+        
+        # 转换为numpy数组
+        bmpstr = saveBitMap.GetBitmapBits(True)
+        img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(capture_height, capture_width, 4)
+        
+        # 清理
+        win32gui.DeleteObject(saveBitMap.GetHandle())
+        saveDC.DeleteDC()
+        mfcDC.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwndDC)
+        
+        # 转换BGRA到BGR
+        img = img[:, :, :3][:, :, ::-1].copy()
+        
+        # 检查是否是全黑图像
+        if np.mean(img) < 1:
+            return None
+            
+        return img
+    except Exception as e:
+        # print(f"捕获窗口失败: {e}")
+        return None
+
+def capture_loop_window(hwnd, region=None):
+    """使用窗口句柄的捕获循环"""
+    global running
+    last_time = 0
+    fail_count = 0
+    while running:
+        t = time.time()
+        if t - last_time < 1.0 / CAPTURE_FPS_LIMIT:
+            time.sleep(max(0, 1.0 / CAPTURE_FPS_LIMIT - (t - last_time)))
+        last_time = time.time()
+        
+        img = capture_window(hwnd, region)
+        if img is None:
+            fail_count += 1
+            if fail_count > 30:  # 连续失败30次则报警
+                print(f"警告: 窗口捕获失败次数过多 ({fail_count}次)")
+                fail_count = 0
+            time.sleep(0.1)
+            continue
+        
+        fail_count = 0  # 重置失败计数
+            
+        # keep only latest frame in queue
+        if not frame_q.empty():
+            try:
+                _ = frame_q.get_nowait()
+            except Exception:
+                pass
+        try:
+            frame_q.put_nowait(img)
+        except Exception:
+            pass
+
+def capture_loop(monitor):
+    global running
+    sct = mss.mss()
+    last_time = 0
+    while running:
+        t = time.time()
+        # 控制最大捕获帧率
+        if t - last_time < 1.0 / CAPTURE_FPS_LIMIT:
+            time.sleep(max(0, 1.0 / CAPTURE_FPS_LIMIT - (t - last_time)))
+        last_time = time.time()
+        img = np.array(sct.grab(monitor))  # BGRA
+        # convert to BGR
+        img = img[:, :, :3][:, :, ::-1].copy()
+        # keep only latest frame in queue
+        if not frame_q.empty():
+            try:
+                _ = frame_q.get_nowait()
+            except Exception:
+                pass
+        try:
+            frame_q.put_nowait(img)
+        except Exception:
+            pass
+
+def process_frame(img, do_hough=True, do_skeleton=False, show_original=True):
+    # optional scale for speed
+    h0, w0 = img.shape[:2]
+    if SHOW_SCALE != 1.0:
+        img = cv2.resize(img, (int(w0 * SHOW_SCALE), int(h0 * SHOW_SCALE)), interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    # Otsu 二值化（适应多种扫描场景）
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 确保前景是白（若背景为白、图形为黑则反转）
+    if np.mean(bw) > 127:
+        bw = 255 - bw
+    # 用形态学开闭去噪
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
+    edges = cv2.Canny(bw, CANNY_LOW, CANNY_HIGH, apertureSize=3)
+    overlay = img.copy()
+    if do_hough:
+        lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi/180, threshold=HOUGH_THRESH,
+                                minLineLength=HOUGH_MINLEN, maxLineGap=HOUGH_MAXGAP)
+        if lines is not None:
+            for x1,y1,x2,y2 in lines[:,0]:
+                cv2.line(overlay, (x1,y1), (x2,y2), (0,0,255), 2)
+    skeleton_img = None
+    if do_skeleton:
+        # skeletonize expects boolean foreground==1
+        bw_bool = (bw > 0)
+        sk = skeletonize(bw_bool)
+        skeleton_img = (sk.astype(np.uint8) * 255)
+        # overlay skeleton in green
+        ys, xs = np.where(sk)
+        overlay[ys, xs] = (0,255,0)  # BGR
+    # combine with original if asked
+    if show_original:
+        alpha = 0.6
+        combined = cv2.addWeighted(img, alpha, overlay, 1 - alpha, 0)
+    else:
+        combined = overlay
+    return combined, edges, skeleton_img
+
+def select_roi_from_frame(frame):
+    # 显示一个临时窗口供用户选择 ROI（返回 dict for mss monitor)
+    tmp = frame.copy()
+    winname = "Select ROI - press ENTER/SPACE to confirm, c to cancel"
+    cv2.namedWindow(winname, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.imshow(winname, tmp)
+    # cv2.selectROI 使用 BGR 图像窗口来选取
+    r = cv2.selectROI(winname, tmp, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow(winname)
+    x,y,w,h = r
+    if w == 0 or h == 0:
+        return None
+    return {"left": int(x), "top": int(y), "width": int(w), "height": int(h)}
+
+def main():
+    global running, target_hwnd
+    
+    print("\n=== 屏幕辅助线提取工具 (窗口捕获模式) ===")
+    print("\n正在扫描可用窗口...\n")
+    
+    # 列出所有窗口
+    windows = list_windows()
+    print("可用窗口列表：")
+    for idx, (hwnd, title) in enumerate(windows[:30]):  # 只显示前30个
+        print(f"  {idx + 1}. {title}")
+    
+    # 让用户选择窗口
+    print("\n请输入窗口编号（输入窗口标题的部分关键字也可以）：")
+    choice = input("> ").strip()
+    
+    # 查找目标窗口
+    target_hwnd = None
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(windows):
+            target_hwnd, target_title = windows[idx]
+    else:
+        # 按关键字搜索
+        for hwnd, title in windows:
+            if choice.lower() in title.lower():
+                target_hwnd = hwnd
+                target_title = title
+                break
+    
+    if not target_hwnd:
+        print("未找到目标窗口，使用屏幕截图模式")
+        # 回退到原来的屏幕截图模式
+        sct = mss.mss()
+        monitors = sct.monitors
+        monitor = monitors[1] if MONITOR_INDEX >= len(monitors) else monitors[MONITOR_INDEX]
+        cap_thread = threading.Thread(target=capture_loop, args=(monitor,), daemon=True)
+        cap_thread.start()
+        region = None
+    else:
+        print(f"\n✓ 已选择窗口: {target_title}")
+        print(f"窗口句柄: {target_hwnd}")
+        
+        # 先截取一帧让用户选择区域
+        print("\n正在截取窗口画面...")
+        temp_img = capture_window(target_hwnd)
+        if temp_img is None:
+            print("无法捕获窗口，退出")
+            return
+        
+        print("请在弹出的窗口中框选要监控的区域")
+        print("提示: 按 Enter/Space 确认整个窗口，或框选部分区域\n")
+        roi = select_roi_from_frame(temp_img)
+        
+        region = None
+        if roi and roi['width'] > 0 and roi['height'] > 0:
+            region = (roi['left'], roi['top'], roi['width'], roi['height'])
+            print(f"✓ 已选择区域: {region}")
+        else:
+            print("使用整个窗口")
+        
+        # 启动窗口捕获线程
+        cap_thread = threading.Thread(target=capture_loop_window, args=(target_hwnd, region), daemon=True)
+        cap_thread.start()
+        print("\n监控已启动！即使窗口被遮挡或最小化也能持续监控")
+        print("监控窗口将显示在屏幕右下角\n")
+
+    do_hough = True
+    do_skeleton = False
+    show_original = True
+    paused = False
+    roi_monitor = None  # 若设置了 roi_monitor 则 overwrite monitor for capture thread（需要重启捕获线程）
+    last_proc_time = time.time()
+    fps = 0.0
+
+    # 创建小窗口并移到右下角，避免挡住目标程序
+    cv2.namedWindow("guides", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    # 设置窗口大小和位置（右下角）
+    window_w, window_h = 640, 360
+    try:
+        screen_w = win32api.GetSystemMetrics(0)
+        screen_h = win32api.GetSystemMetrics(1)
+    except:
+        screen_w, screen_h = 2560, 1440
+    cv2.resizeWindow("guides", window_w, window_h)
+    cv2.moveWindow("guides", screen_w - window_w - 50, screen_h - window_h - 100)
+
+    try:
+        while True:
+            # 检查窗口是否被关闭
+            if cv2.getWindowProperty("guides", cv2.WND_PROP_VISIBLE) < 1:
+                print("窗口已关闭")
+                running = False
+                break
+            
+            # get latest frame
+            try:
+                frame = frame_q.get(timeout=1.0)
+            except Empty:
+                # 即使没有新帧也要检测按键和窗口状态
+                k = cv2.waitKey(10) & 0xFF
+                if k == ord('q'):
+                    running = False
+                    break
+                continue
+            
+            k = 0xFF  # 初始化按键变量
+            if paused:
+                cv2.imshow("guides", frame)
+                k = cv2.waitKey(30) & 0xFF
+            else:
+                t0 = time.time()
+                combined, edges, skeleton_img = process_frame(frame, do_hough=do_hough,
+                                                              do_skeleton=do_skeleton, show_original=show_original)
+                t1 = time.time()
+                # FPS smoothing
+                dt = t1 - last_proc_time
+                if dt > 0:
+                    fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else (1.0 / dt)
+                last_proc_time = t1
+
+                # overlay info
+                info = f"FPS:{fps:.1f}  Hough:{'on' if do_hough else 'off'}  Skeleton:{'on' if do_skeleton else 'off'}"
+                cv2.putText(combined, info, (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+                cv2.imshow("guides", combined)
+                k = cv2.waitKey(1) & 0xFF
+
+            if k == ord('q'):
+                running = False
+                break
+            elif k == ord('h'):
+                do_hough = not do_hough
+            elif k == ord('k'):
+                do_skeleton = not do_skeleton
+            elif k == ord('o'):
+                show_original = not show_original
+            elif k == ord('p'):
+                paused = not paused
+            elif k == ord('r'):
+                # 暂停捕获队列并弹出最新一帧供 ROI 选择
+                try:
+                    tmp = frame.copy()
+                    roi = select_roi_from_frame(tmp)
+                    if roi:
+                        # update monitor to selected region for faster capture: NOTE: requires restarting capture thread - simplest is to assign monitor in place
+                        monitor_rect = {"left": roi["left"], "top": roi["top"], "width": roi["width"], "height": roi["height"]}
+                        print("设置 ROI:", monitor_rect)
+                        # restart capture thread with new monitor region
+                        running = False
+                        cap_thread.join(timeout=1.0)
+                        # start new capture thread with ROI region
+                        running = True
+                        cap_thread = threading.Thread(target=capture_loop, args=(monitor_rect,), daemon=True)
+                        cap_thread.start()
+                except Exception as e:
+                    print("ROI 选择失败:", e)
+
+    except KeyboardInterrupt:
+        running = False
+    finally:
+        running = False
+        cap_thread.join(timeout=1.0)
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
