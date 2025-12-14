@@ -18,7 +18,7 @@ import win32gui
 import mss
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
-
+from saomiao.aiming import process_frame_for_aim
 # --------- 配置 ----------
 CAPTURE_FPS_LIMIT = 30
 
@@ -782,3 +782,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
